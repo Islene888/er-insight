@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import signal
@@ -6,6 +7,7 @@ import threading
 from ..consumers.pubsub_consumer import PubSubConsumer
 from ..consumers.sqs_consumer import SQSConsumer
 from ..metrics.prometheus_metrics import pipeline_active, start_metrics_server
+from ..replication.region_replicator import RegionReplicator
 from ..storage.mongo_writer import MongoWriter
 
 logger = logging.getLogger(__name__)
@@ -45,10 +47,29 @@ class IngestionPipeline:
             region=os.environ.get("AWS_REGION", "us-east-1"),
         )
 
+        # Cross-region replication (optional, configured via env)
+        self.replicator = self._build_replicator(mongo_uri, db_name)
+
         self._stop_event = threading.Event()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, self._handle_shutdown)
+
+    @staticmethod
+    def _build_replicator(mongo_uri: str, db_name: str) -> RegionReplicator | None:
+        raw = os.environ.get("SECONDARY_REGIONS")
+        if not raw:
+            return None
+        try:
+            secondary_uris = json.loads(raw)  # '{"us-west-2": "mongodb://...", ...}'
+        except json.JSONDecodeError:
+            logger.warning("Invalid SECONDARY_REGIONS JSON, replication disabled")
+            return None
+        return RegionReplicator(
+            primary_uri=mongo_uri,
+            secondary_uris=secondary_uris,
+            db_name=db_name,
+        )
 
     def run(self):
         metrics_port = int(os.environ.get("METRICS_PORT", "8000"))
@@ -62,6 +83,10 @@ class IngestionPipeline:
             threading.Thread(target=self._run_loop, args=(self.pubsub.listen, "pubsub"), daemon=True),
             threading.Thread(target=self._run_loop, args=(self.sqs.listen, "sqs"), daemon=True),
         ]
+        if self.replicator:
+            threads.append(self.replicator.start_async())
+            logger.info("Cross-region replication enabled")
+
         for t in threads:
             t.start()
 

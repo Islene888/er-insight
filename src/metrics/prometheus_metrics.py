@@ -36,6 +36,18 @@ pipeline_active = Gauge(
     "Pipeline liveness: 1 = running, 0 = stopped",
 )
 
+replication_lag = Gauge(
+    "er_replication_lag_seconds",
+    "Estimated replication lag to each secondary region",
+    ["region"],
+)
+
+replication_errors = Counter(
+    "er_replication_errors_total",
+    "Failed replication attempts to secondary regions",
+    ["region"],
+)
+
 
 def start_metrics_server(port: int = 8000):
     start_http_server(port)

@@ -51,7 +51,7 @@ A production-grade, fault-tolerant data ingestion pipeline for high-volume Elect
 er-insight/
 ├── src/
 │   ├── consumers/
-│   │   ├── base_consumer.py       # Idempotent base, retry, DLQ
+│   │   ├── base_consumer.py       # Exactly-once base (atomic lock + retry + Cloud Tasks DLQ)
 │   │   ├── pubsub_consumer.py     # GCP Pub/Sub consumer
 │   │   └── sqs_consumer.py        # AWS SQS/SNS consumer
 │   ├── schema/
@@ -59,19 +59,64 @@ er-insight/
 │   ├── storage/
 │   │   └── mongo_writer.py        # Batched bulk_write with upsert
 │   ├── metrics/
-│   │   └── prometheus_metrics.py  # Counters, histograms, gauges
+│   │   └── prometheus_metrics.py  # Counters, histograms, gauges (incl. replication lag)
+│   ├── retry/
+│   │   ├── cloud_tasks_queue.py   # GCP Cloud Tasks delayed retry (30s/2m/10m/1h schedule)
+│   │   └── retry_handler.py       # FastAPI endpoint that receives Cloud Tasks callbacks
+│   ├── replication/
+│   │   └── region_replicator.py   # MongoDB change stream → multi-region upsert
 │   └── pipeline/
-│       └── ingestion_pipeline.py  # Orchestrator (parallel threads)
+│       └── ingestion_pipeline.py  # Orchestrator (parallel threads + replication)
 ├── tests/
 │   ├── test_base_consumer.py
 │   ├── test_schema.py
-│   └── test_mongo_writer.py
+│   ├── test_mongo_writer.py
+│   └── test_region_replicator.py
 ├── config/
 │   └── config.yaml.example
 ├── docker-compose.yml
 ├── Dockerfile
 └── requirements.txt
 ```
+
+## Exactly-Once Delivery
+
+Instead of the common (broken) find-then-insert pattern, we use an **atomic insert as a distributed lock**:
+
+```
+insert_one({message_id, status: "processing"})   ← atomic claim
+    ├── DuplicateKeyError → skip (another instance owns it)
+    └── success → handle() → update status to "done"
+                     └── failure → update to "failed" → Cloud Tasks retry
+```
+
+This eliminates the TOCTOU race condition under concurrent consumers.
+
+## Cloud Tasks Retry Schedule
+
+Failed messages (after 3 in-process retries) are enqueued to GCP Cloud Tasks with exponential delays rather than immediately dropped to DLQ:
+
+| Attempt | Delay |
+|---|---|
+| 1 | 30 seconds |
+| 2 | 2 minutes |
+| 3 | 10 minutes |
+| 4 | 1 hour |
+| 5+ | Permanent DLQ |
+
+Cloud Tasks calls back `POST /retry` on our FastAPI handler, which reprocesses from a clean context.
+
+## Cross-Region Replication
+
+`RegionReplicator` watches the primary MongoDB **change stream** and fans out to secondary instances in other regions:
+
+```python
+SECONDARY_REGIONS='{"us-west-2": "mongodb://...", "eu-west-1": "mongodb://..."}'
+```
+
+- Resume token persisted in MongoDB — restarts replay from last processed event, no data loss
+- Idempotent upserts (`$setOnInsert`) — safe to replay
+- Per-region replication error counter in Prometheus
 
 ## Tech Stack
 
