@@ -1,48 +1,141 @@
 # ER-Insight — Multi-Cloud Data Ingestion Pipeline
 
-A fault-tolerant, multi-cloud data ingestion pipeline for high-volume ER (Electronic Records) data, built on **Google Cloud Pub/Sub**, **AWS SQS/SNS**, and **MongoDB**.
+A production-grade, fault-tolerant data ingestion pipeline for high-volume Electronic Records (ER) data. Ingests from **Google Cloud Pub/Sub** and **AWS SQS/SNS** in parallel, normalizes heterogeneous record types, and writes to **MongoDB** with exactly-once delivery guarantees.
+
+## Key Stats
+
+| Metric | Value |
+|---|---|
+| Daily record volume | 200K+ records/day |
+| Monthly message throughput | 100M+ messages/month |
+| Delivery guarantee | Exactly-once (idempotent consumers + DLQ) |
+| Sources | GCP Pub/Sub + AWS SQS/SNS |
+| Storage | MongoDB (sharded by `source_region`) |
 
 ## Architecture
 
 ```
-Raw Sources
-    │
-    ├── GCP Pub/Sub  ──► PubSubConsumer  ─┐
-    │                                     ├──► IngestionPipeline ──► MongoDB
-    └── AWS SQS/SNS  ──► SQSConsumer    ─┘
+┌─────────────────────────────────────────────────────────┐
+│                    External Sources                      │
+│   GCP Pub/Sub          AWS SQS/SNS        (future: Kafka)│
+└──────┬────────────────────────┬───────────────────────── ┘
+       │                        │
+       ▼                        ▼
+┌──────────────┐       ┌──────────────┐
+│ PubSubConsumer│       │  SQSConsumer  │   (parallel threads)
+└──────┬───────┘       └──────┬───────┘
+       │   idempotency check  │
+       └──────────┬───────────┘
+                  ▼
+         ┌────────────────┐
+         │  BaseConsumer  │  dedup via processed_messages index
+         │  + DLQ routing │  retry with exponential backoff
+         └───────┬────────┘
+                 │  batch upsert
+                 ▼
+         ┌────────────────┐      ┌──────────────────┐
+         │   MongoWriter  │────► │  MongoDB          │
+         │  (bulk_write)  │      │  er_records       │
+         └────────────────┘      │  processed_msgs   │
+                                 └──────────────────┘
+                 │ metrics
+                 ▼
+         ┌────────────────┐
+         │   Prometheus   │ ──► Grafana dashboard
+         └────────────────┘
 ```
-
-- **200K+ daily records** ingested across multi-cloud sources
-- **100M+ messages/month** sustained via Pub/Sub + Cloud Tasks
-- Cross-region replication and disaster recovery built-in
-- Idempotent consumers with dead-letter queues for exactly-once delivery
 
 ## Project Structure
 
 ```
-src/
-├── consumers/
-│   ├── base_consumer.py      # Idempotent base consumer with DLQ support
-│   ├── pubsub_consumer.py    # GCP Pub/Sub consumer
-│   └── sqs_consumer.py       # AWS SQS/SNS consumer
-├── schema/
-│   └── er_record.py          # MongoDB document schema for ER record types
-└── pipeline/
-    └── ingestion_pipeline.py # Main orchestration pipeline
+er-insight/
+├── src/
+│   ├── consumers/
+│   │   ├── base_consumer.py       # Idempotent base, retry, DLQ
+│   │   ├── pubsub_consumer.py     # GCP Pub/Sub consumer
+│   │   └── sqs_consumer.py        # AWS SQS/SNS consumer
+│   ├── schema/
+│   │   └── er_record.py           # MongoDB document schema (5 record types)
+│   ├── storage/
+│   │   └── mongo_writer.py        # Batched bulk_write with upsert
+│   ├── metrics/
+│   │   └── prometheus_metrics.py  # Counters, histograms, gauges
+│   └── pipeline/
+│       └── ingestion_pipeline.py  # Orchestrator (parallel threads)
+├── tests/
+│   ├── test_base_consumer.py
+│   ├── test_schema.py
+│   └── test_mongo_writer.py
+├── config/
+│   └── config.yaml.example
+├── docker-compose.yml
+├── Dockerfile
+└── requirements.txt
 ```
 
 ## Tech Stack
 
-- **Messaging**: Google Cloud Pub/Sub, AWS SQS/SNS, Cloud Tasks
-- **Storage**: MongoDB (with sharding for heterogeneous ER record types)
-- **Languages**: Python, Java
-- **Reliability**: Idempotent consumers, DLQ, retry logic, cross-region replication
+- **Messaging**: Google Cloud Pub/Sub, AWS SQS/SNS
+- **Storage**: MongoDB 7 (sharded collection, compound indexes)
+- **Observability**: Prometheus metrics, structured logging
+- **Reliability**: Idempotent consumers, dead-letter queues, exponential backoff, bulk upsert
+- **Infra**: Docker Compose (local), deployable to GKE / ECS
 
-## Setup
+## Quick Start
 
 ```bash
+# 1. Clone and install
 pip install -r requirements.txt
+
+# 2. Configure
 cp config/config.yaml.example config/config.yaml
-# Fill in GCP project ID, AWS credentials, MongoDB URI
+# Edit config.yaml with your GCP project, AWS credentials, MongoDB URI
+
+# 3. Run locally with Docker Compose (spins up MongoDB + pipeline)
+docker-compose up
+
+# 4. Run pipeline directly
+export MONGO_URI=mongodb://localhost:27017
+export GCP_PROJECT_ID=your-project
+export PUBSUB_SUBSCRIPTION=er-records-sub
+export SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/...
+export SQS_DLQ_URL=https://sqs.us-east-1.amazonaws.com/...-dlq
 python -m src.pipeline.ingestion_pipeline
+```
+
+## Metrics (Prometheus)
+
+| Metric | Type | Description |
+|---|---|---|
+| `er_messages_processed_total` | Counter | Messages successfully ingested, by source |
+| `er_messages_failed_total` | Counter | Messages routed to DLQ, by source + error |
+| `er_duplicates_skipped_total` | Counter | Duplicate messages dropped |
+| `er_processing_duration_seconds` | Histogram | Per-message processing latency |
+| `er_batch_write_size` | Histogram | MongoDB bulk write batch sizes |
+| `er_pipeline_active` | Gauge | Pipeline liveness (1 = running) |
+
+Prometheus endpoint exposed at `:8000/metrics`.
+
+## MongoDB Schema
+
+Records are stored in `er_records` collection, sharded by `source_region`:
+
+```json
+{
+  "_id": "<record_id>",
+  "record_type": "admission | discharge | lab_result | medication | diagnosis",
+  "patient_id": "...",
+  "source_region": "us-east-1 | us-west-2 | eu-west-1",
+  "payload": { ... },
+  "ingested_at": "2025-01-01T00:00:00Z",
+  "schema_version": "1.0",
+  "checksum": "sha256:..."
+}
+```
+
+## Running Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
 ```

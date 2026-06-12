@@ -1,0 +1,17 @@
+mongo:
+  uri: mongodb://localhost:27017
+  db: er_insight
+  batch_size: 100
+  flush_interval: 2.0
+
+gcp:
+  project_id: your-gcp-project
+  pubsub_subscription: er-records-sub
+
+aws:
+  region: us-east-1
+  sqs_queue_url: https://sqs.us-east-1.amazonaws.com/123456789/er-records
+  sqs_dlq_url: https://sqs.us-east-1.amazonaws.com/123456789/er-records-dlq
+
+metrics:
+  port: 8000

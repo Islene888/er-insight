@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: er_insight
+
+  pipeline:
+    build: .
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DB: er_insight
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID}
+      PUBSUB_SUBSCRIPTION: ${PUBSUB_SUBSCRIPTION}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL}
+      SQS_DLQ_URL: ${SQS_DLQ_URL}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      METRICS_PORT: "8000"
+      BATCH_SIZE: "100"
+      FLUSH_INTERVAL: "2.0"
+    ports:
+      - "8000:8000"
+
+volumes:
+  mongo_data:
